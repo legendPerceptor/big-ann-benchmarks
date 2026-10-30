@@ -10,7 +10,8 @@ from scipy.sparse import csr_matrix
 
 from benchmark.algorithms.pg_exact import PGFilterExact, PGSparseExact
 from benchmark.algorithms.pg_dense import PGDenseANN
-from benchmark.algorithms.pg_filtered import PGFilteredANN
+from benchmark.algorithms.pg_filtered import PGFilteredANN, FUSED_EXACT_PROBE_SQL
+from neurips23.streaming.gsvector.module import encode_vector
 from benchmark.dataset_io import write_sparse_matrix
 from benchmark.datasets import DATASETS
 from benchmark.local_dataset import LocalDenseDataset, LocalCSRDataset
@@ -34,6 +35,20 @@ class SparseValidationTests(unittest.TestCase):
         result = PGSparseExact.validate_csr(matrix)
         self.assertEqual(result.shape, (2, 30109))
         self.assertEqual(result.nnz, 2)
+
+
+class FilterQueryArgumentTests(unittest.TestCase):
+    def test_fused_probe_is_explicit_boolean_and_resets(self):
+        adapter=object.__new__(PGFilteredANN)
+        adapter.set_query_arguments({})
+        self.assertFalse(adapter.fused_exact_probe)
+        adapter.set_query_arguments({"fused_exact_probe":True})
+        self.assertTrue(adapter.fused_exact_probe)
+        adapter.set_query_arguments({})
+        self.assertFalse(adapter.fused_exact_probe)
+        for value in (0,1,"false",None):
+            with self.assertRaises(ValueError):
+                adapter.set_query_arguments({"fused_exact_probe":value})
 
 
 @unittest.skipUnless(os.environ.get("GSVECTOR_PG_DSN"), "requires private PostgreSQL")
@@ -265,6 +280,44 @@ class StaticIntegrationTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(Path(item["pg_events_file"]).read_bytes()).hexdigest(),
                                  item["pg_events_sha256"])
                 self.assertTrue(item["native_ann"])
+            # Compare identical routing/budgets; include small, empty, broad,
+            # conjunction and unfiltered predicates, and fewer-than-k results.
+            for cutoff in (8,96):
+                outputs=[]
+                route_counts=[]
+                for fused in (False,True):
+                    adapter.set_query_arguments({
+                        "threads":2,"search_l":16,"initial_candidates":8,
+                        "max_candidates":96,"exact_cutoff":cutoff,
+                        "fused_exact_probe":fused})
+                    adapter.filtered_query(queries,ds.get_queries_metadata(),5)
+                    outputs.append(adapter.get_results().copy())
+                    route_counts.append(tuple(adapter.stats[key] for key in
+                        ("small_exact_queries","ann_queries","fallback_exact_queries","ann_attempts")))
+                    self.assertEqual(adapter.stats["fused_probe_queries"],3 if fused else 0)
+                    for phase in ("probe_s","small_exact_s","ann_s","fallback_exact_s"):
+                        self.assertGreaterEqual(adapter.stats[phase],0)
+                np.testing.assert_array_equal(*outputs)
+                self.assertEqual(*route_counts)
+            # A full bounded set is exact; cutoff+1 must return NO partial top-k.
+            with adapter._connect() as conn:
+                for cutoff,expected in ((15,[]),(16,[80,81,82,83,84])):
+                    count,found=conn.execute(FUSED_EXACT_PROBE_SQL,
+                        ([1],cutoff+1,cutoff,encode_vector(queries[0]),5)).fetchone()
+                    self.assertEqual(count,16)
+                    self.assertEqual(found,expected)
+                count,found=conn.execute(FUSED_EXACT_PROBE_SQL,
+                    ([1,2],9,8,encode_vector(queries[0]),10)).fetchone()
+                self.assertEqual(count,8)
+                self.assertEqual(found,list(range(80,96,2)))
+                # UPDATE creates new tuple versions: CTIDs must be rediscovered,
+                # and equal distances must still use the exact path's ID tie-break.
+                conn.execute("UPDATE base SET embedding=%s WHERE id>=80",
+                             (encode_vector(queries[0]),))
+                count,found=conn.execute(FUSED_EXACT_PROBE_SQL,
+                    ([1],17,16,encode_vector(queries[0]),5)).fetchone()
+                self.assertEqual(count,16)
+                self.assertEqual(found,[80,81,82,83,84])
         finally:
             adapter.done()
 
